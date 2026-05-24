@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -268,6 +270,80 @@ func TestToolResultForwardedAsFunctionResponse(t *testing.T) {
 	}
 }
 
+
+func TestStreamingRetriesOnRateLimitBeforeHeadersWritten(t *testing.T) {
+	var mu sync.Mutex
+	keys := []string{}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		mu.Lock()
+		keys = append(keys, key)
+		mu.Unlock()
+
+		if key == "bad" {
+			http.Error(w, `{"error":{"code":429,"message":"quota exceeded"}}`, http.StatusTooManyRequests)
+			return
+		}
+		// Good key: respond with a minimal SSE stream
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}]}\n\n")
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL, ModelKeyPool{
+		GoogleModel:       "gemini-test",
+		APIKeys:           []string{"bad", "good"},
+		RequestsPerAPIKey: 100,
+	})
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"gpt-test","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("expected SSE content type, got %q", ct)
+	}
+
+	// Read chunks and collect text
+	var text string
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+		var chunk ChatCompletionChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
+			text += chunk.Choices[0].Delta.Content
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(keys, ",") != "bad,good" {
+		t.Fatalf("expected retry on good key after bad 429, got keys: %v", keys)
+	}
+	if text != "hello" {
+		t.Fatalf("expected streamed text 'hello', got %q", text)
+	}
+}
 
 func newTestProxy(t *testing.T, upstreamURL string, pool ModelKeyPool) http.Handler {
 	t.Helper()

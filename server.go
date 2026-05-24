@@ -128,95 +128,108 @@ func (s *ProxyServer) generateGemini(w http.ResponseWriter, r *http.Request, ope
 }
 
 func (s *ProxyServer) streamGemini(w http.ResponseWriter, r *http.Request, openReq ChatCompletionRequest, geminiReq GeminiRequest) {
-	lease, err := s.keys.Lease(openReq.Model)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
-		return
-	}
-	payload, _ := json.Marshal(geminiReq)
-	endpoint := s.googleURL(lease.GoogleModel, "streamGenerateContent", lease.APIKey)
-	endpoint += "&alt=sse"
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, endpoint, bytes.NewReader(payload))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(req)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error(), "upstream_error")
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		if retryableStatus(resp.StatusCode) {
-			s.keys.ForceRotate(openReq.Model, lease.Index)
-		}
-		writeError(w, googleHTTPStatus(resp.StatusCode), string(b), "upstream_error")
-		return
-	}
-
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming unsupported by server", "server_error")
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
 
-	id := newCompletionID()
-	created := time.Now().Unix()
-	writeSSE(w, ChatCompletionChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: openReq.Model, Choices: []ChatChoice{{Index: 0, Delta: &ChatDelta{Role: "assistant"}}}})
-	flusher.Flush()
+	payload, _ := json.Marshal(geminiReq)
+	attempts := s.maxAttempts(openReq.Model)
+	var lastErr string
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 16*1024), 2*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, ":") {
+	for i := 0; i < attempts; i++ {
+		lease, err := s.keys.Lease(openReq.Model)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+			return
+		}
+		endpoint := s.googleURL(lease.GoogleModel, "streamGenerateContent", lease.APIKey) + "&alt=sse"
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, endpoint, bytes.NewReader(payload))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := s.client.Do(req)
+		if err != nil {
+			lastErr = err.Error()
 			continue
 		}
-		if !strings.HasPrefix(line, "data:") {
-			continue
+		if resp.StatusCode >= 400 {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			lastErr = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+			if retryableStatus(resp.StatusCode) {
+				s.keys.ForceRotate(openReq.Model, lease.Index)
+				slog.Warn("stream upstream error, rotating key and retrying", "attempt", i+1, "status", resp.StatusCode, "model", openReq.Model)
+				continue
+			}
+			writeError(w, googleHTTPStatus(resp.StatusCode), lastErr, "upstream_error")
+			return
 		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			break
-		}
-		var gr GeminiResponse
-		if err := json.Unmarshal([]byte(data), &gr); err != nil {
-			slog.Warn("skipping malformed Google stream event", "error", err)
-			continue
-		}
-		finish := geminiFinishReason(gr)
-		if len(gr.Candidates) == 0 {
-			continue
-		}
-		for i, p := range gr.Candidates[0].Content.Parts {
-			if p.FunctionCall != nil {
-				argsJSON, _ := json.Marshal(p.FunctionCall.Args)
-				delta := &ChatDelta{ToolCalls: []DeltaToolCall{{
-					Index: i,
-					ID:    fmt.Sprintf("call_%d", i),
-					Type:  "function",
-					Function: DeltaFunction{
-						Name:      p.FunctionCall.Name,
-						Arguments: string(argsJSON),
-					},
-				}}}
-				writeSSE(w, ChatCompletionChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: openReq.Model, Choices: []ChatChoice{{Index: 0, Delta: delta, FinishReason: finish}}})
-				flusher.Flush()
-			} else if p.Text != "" {
-				writeSSE(w, ChatCompletionChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: openReq.Model, Choices: []ChatChoice{{Index: 0, Delta: &ChatDelta{Content: p.Text}, FinishReason: finish}}})
-				flusher.Flush()
+
+		// Committed to streaming — write headers and pump the response body.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+
+		id := newCompletionID()
+		created := time.Now().Unix()
+		writeSSE(w, ChatCompletionChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: openReq.Model, Choices: []ChatChoice{{Index: 0, Delta: &ChatDelta{Role: "assistant"}}}})
+		flusher.Flush()
+
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 16*1024), 2*1024*1024)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, ":") {
+				continue
+			}
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "[DONE]" {
+				break
+			}
+			var gr GeminiResponse
+			if err := json.Unmarshal([]byte(data), &gr); err != nil {
+				slog.Warn("skipping malformed Google stream event", "error", err)
+				continue
+			}
+			finish := geminiFinishReason(gr)
+			if len(gr.Candidates) == 0 {
+				continue
+			}
+			for i, p := range gr.Candidates[0].Content.Parts {
+				if p.FunctionCall != nil {
+					argsJSON, _ := json.Marshal(p.FunctionCall.Args)
+					delta := &ChatDelta{ToolCalls: []DeltaToolCall{{
+						Index: i,
+						ID:    fmt.Sprintf("call_%d", i),
+						Type:  "function",
+						Function: DeltaFunction{
+							Name:      p.FunctionCall.Name,
+							Arguments: string(argsJSON),
+						},
+					}}}
+					writeSSE(w, ChatCompletionChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: openReq.Model, Choices: []ChatChoice{{Index: 0, Delta: delta, FinishReason: finish}}})
+					flusher.Flush()
+				} else if p.Text != "" {
+					writeSSE(w, ChatCompletionChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: openReq.Model, Choices: []ChatChoice{{Index: 0, Delta: &ChatDelta{Content: p.Text}, FinishReason: finish}}})
+					flusher.Flush()
+				}
 			}
 		}
+		resp.Body.Close()
+		writeRawSSE(w, "[DONE]")
+		flusher.Flush()
+		return
 	}
-	writeRawSSE(w, "[DONE]")
-	flusher.Flush()
+
+	writeError(w, http.StatusBadGateway, "all configured Google API keys failed or were rate-limited: "+lastErr, "upstream_error")
 }
 
 func (s *ProxyServer) callGoogle(r *http.Request, lease KeyLease, action string, payload any) ([]byte, int, error) {
