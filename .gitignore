@@ -1,0 +1,6 @@
+tools/
+*.log
+.env
+.env.*
+!config.example.json
+google-ai-openai-proxy

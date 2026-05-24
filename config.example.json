@@ -1,0 +1,23 @@
+{
+  "listen_addr": ":8080",
+  "google_base_url": "https://generativelanguage.googleapis.com/v1beta/models",
+  "upstream_timeout": "120s",
+  "proxy_api_keys": ["replace-with-your-openai-compatible-proxy-key"],
+  "default": {
+    "google_model": "gemini-1.5-flash",
+    "api_keys": ["google-key-1", "google-key-2"],
+    "requests_per_api_key": 1000
+  },
+  "models": {
+    "gpt-4o-mini": {
+      "google_model": "gemini-1.5-flash",
+      "api_keys": ["flash-key-1", "flash-key-2", "flash-key-3"],
+      "requests_per_api_key": 500
+    },
+    "gpt-4o": {
+      "google_model": "gemini-1.5-pro",
+      "api_keys": ["pro-key-1", "pro-key-2"],
+      "requests_per_api_key": 200
+    }
+  }
+}
