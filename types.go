@@ -115,6 +115,18 @@ type GeminiContent struct {
 
 type GeminiPart struct {
 	Text             string                  `json:"text,omitempty"`
+	FunctionCall     *GeminiFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *GeminiFunctionResponse `json:"functionResponse,omitempty"`
+}
+
+type GeminiFunctionCall struct {
+	Name string `json:"name"`
+	Args any    `json:"args,omitempty"`
+}
+
+type GeminiFunctionResponse struct {
+	Name     string `json:"name"`
+	Response any    `json:"response,omitempty"`
 }
 
 type GenerationConfig struct {

@@ -143,6 +143,132 @@ func TestRetryableUpstreamErrorForcesRotation(t *testing.T) {
 	}
 }
 
+func TestToolCallRoundtrip(t *testing.T) {
+	// Simulates a Gemini response that contains a functionCall part.
+	// Verifies the proxy translates it back into OpenAI tool_calls shape.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify tools were forwarded as Gemini functionDeclarations
+		var body GeminiRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("bad request body: %v", err)
+		}
+		if len(body.Tools) == 0 || len(body.Tools[0].FunctionDeclarations) == 0 {
+			t.Fatalf("expected functionDeclarations, got: %#v", body.Tools)
+		}
+		if body.Tools[0].FunctionDeclarations[0].Name != "get_weather" {
+			t.Fatalf("unexpected function name: %s", body.Tools[0].FunctionDeclarations[0].Name)
+		}
+		// Respond with a functionCall part
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"candidates":[{
+				"content":{"parts":[{"functionCall":{"name":"get_weather","args":{"location":"London"}}}]},
+				"finishReason":"STOP"
+			}]
+		}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL, ModelKeyPool{GoogleModel: "gemini-test", APIKeys: []string{"k1"}, RequestsPerAPIKey: 100})
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+
+	reqBody := `{
+		"model":"gpt-test",
+		"messages":[{"role":"user","content":"What is the weather in London?"}],
+		"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}}}]
+	}`
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var out ChatCompletionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Choices) == 0 {
+		t.Fatal("no choices in response")
+	}
+	msg := out.Choices[0].Message
+	if len(msg.ToolCalls) == 0 {
+		t.Fatalf("expected tool_calls in response, got none. message: %#v", msg)
+	}
+	tc := msg.ToolCalls[0]
+	if tc.Type != "function" {
+		t.Fatalf("expected type=function, got %q", tc.Type)
+	}
+	if tc.Function.Name != "get_weather" {
+		t.Fatalf("expected name=get_weather, got %q", tc.Function.Name)
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+		t.Fatalf("tool call arguments not valid JSON: %v", err)
+	}
+	if args["location"] != "London" {
+		t.Fatalf("expected location=London, got %v", args["location"])
+	}
+}
+
+func TestToolResultForwardedAsFunctionResponse(t *testing.T) {
+	// Verifies that a tool role message is forwarded as a Gemini functionResponse part.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body GeminiRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("bad body: %v", err)
+		}
+		// Expect: user(hello) → model(functionCall) → user(functionResponse)
+		if len(body.Contents) < 3 {
+			t.Fatalf("expected 3 content turns, got %d: %#v", len(body.Contents), body.Contents)
+		}
+		lastTurn := body.Contents[2]
+		if lastTurn.Role != "user" {
+			t.Fatalf("expected last role=user, got %q", lastTurn.Role)
+		}
+		if len(lastTurn.Parts) == 0 || lastTurn.Parts[0].FunctionResponse == nil {
+			t.Fatalf("expected functionResponse part, got: %#v", lastTurn.Parts)
+		}
+		if lastTurn.Parts[0].FunctionResponse.Name != "get_weather" {
+			t.Fatalf("expected functionResponse.name=get_weather, got %q", lastTurn.Parts[0].FunctionResponse.Name)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"It is 15°C in London."}]},"finishReason":"STOP"}]}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL, ModelKeyPool{GoogleModel: "gemini-test", APIKeys: []string{"k1"}, RequestsPerAPIKey: 100})
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+
+	reqBody := `{
+		"model":"gpt-test",
+		"messages":[
+			{"role":"user","content":"What is the weather in London?"},
+			{"role":"assistant","tool_calls":[{"id":"call_0","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"London\"}"}}]},
+			{"role":"tool","tool_call_id":"call_0","name":"get_weather","content":"{\"temperature\":15,\"unit\":\"C\"}"}
+		]
+	}`
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var out ChatCompletionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Choices[0].Message.Content != "It is 15°C in London." {
+		t.Fatalf("unexpected content: %q", out.Choices[0].Message.Content)
+	}
+}
+
+
 func newTestProxy(t *testing.T, upstreamURL string, pool ModelKeyPool) http.Handler {
 	t.Helper()
 	cfg := Config{

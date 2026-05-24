@@ -195,8 +195,21 @@ func (s *ProxyServer) streamGemini(w http.ResponseWriter, r *http.Request, openR
 		if len(gr.Candidates) == 0 {
 			continue
 		}
-		for _, p := range gr.Candidates[0].Content.Parts {
-			if p.Text != "" {
+		for i, p := range gr.Candidates[0].Content.Parts {
+			if p.FunctionCall != nil {
+				argsJSON, _ := json.Marshal(p.FunctionCall.Args)
+				delta := &ChatDelta{ToolCalls: []DeltaToolCall{{
+					Index: i,
+					ID:    fmt.Sprintf("call_%d", i),
+					Type:  "function",
+					Function: DeltaFunction{
+						Name:      p.FunctionCall.Name,
+						Arguments: string(argsJSON),
+					},
+				}}}
+				writeSSE(w, ChatCompletionChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: openReq.Model, Choices: []ChatChoice{{Index: 0, Delta: delta, FinishReason: finish}}})
+				flusher.Flush()
+			} else if p.Text != "" {
 				writeSSE(w, ChatCompletionChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: openReq.Model, Choices: []ChatChoice{{Index: 0, Delta: &ChatDelta{Content: p.Text}, FinishReason: finish}}})
 				flusher.Flush()
 			}
@@ -258,25 +271,40 @@ func toGeminiRequest(req ChatCompletionRequest) (GeminiRequest, error) {
 				}
 			}
 		case "assistant":
-			parts := make([]string, 0, 2)
+			var parts []GeminiPart
 			if text != "" {
-				parts = append(parts, text)
+				parts = append(parts, GeminiPart{Text: text})
 			}
-			if len(m.ToolCalls) > 0 {
-				parts = append(parts, toolCallsToText(m.ToolCalls))
+			for _, tc := range m.ToolCalls {
+				var args any
+				if tc.Function.Arguments != "" {
+					_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+					if args == nil {
+						args = tc.Function.Arguments
+					}
+				}
+				parts = append(parts, GeminiPart{FunctionCall: &GeminiFunctionCall{Name: tc.Function.Name, Args: args}})
 			}
-			joined := strings.TrimSpace(strings.Join(parts, "\n"))
-			if joined != "" {
-				out.Contents = append(out.Contents, GeminiContent{Role: "model", Parts: []GeminiPart{{Text: joined}}})
+			if len(parts) > 0 {
+				out.Contents = append(out.Contents, GeminiContent{Role: "model", Parts: parts})
 			}
 		case "user":
 			if text != "" {
 				out.Contents = append(out.Contents, GeminiContent{Role: "user", Parts: []GeminiPart{{Text: text}}})
 			}
 		case "tool":
+			var resp any
 			if text != "" {
-				out.Contents = append(out.Contents, GeminiContent{Role: "user", Parts: []GeminiPart{{Text: text}}})
+				_ = json.Unmarshal([]byte(text), &resp)
+				if resp == nil {
+					resp = map[string]any{"output": text}
+				}
+			} else {
+				resp = map[string]any{}
 			}
+			out.Contents = append(out.Contents, GeminiContent{Role: "user", Parts: []GeminiPart{{
+				FunctionResponse: &GeminiFunctionResponse{Name: m.Name, Response: resp},
+			}}})
 		default:
 			return out, fmt.Errorf("unsupported message role %q", m.Role)
 		}
@@ -341,22 +369,45 @@ func convertTools(tools []any) []GeminiTool {
 }
 
 func toOpenAIResponse(req ChatCompletionRequest, gr GeminiResponse) ChatCompletionResponse {
+	msg := geminiToMessage(gr)
 	return ChatCompletionResponse{
 		ID:      newCompletionID(),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
 		Model:   req.Model,
-		Choices: []ChatChoice{{Index: 0, Message: ChatMessage{Role: "assistant", Content: geminiText(gr)}, FinishReason: geminiFinishReason(gr)}},
+		Choices: []ChatChoice{{Index: 0, Message: msg, FinishReason: geminiFinishReason(gr)}},
 		Usage:   Usage{PromptTokens: gr.UsageMetadata.PromptTokenCount, CompletionTokens: gr.UsageMetadata.CandidatesTokenCount, TotalTokens: gr.UsageMetadata.TotalTokenCount},
 	}
 }
 
-func toolCallsToText(toolCalls []ToolCall) string {
-	if len(toolCalls) == 0 {
-		return ""
+// geminiToMessage converts a GeminiResponse candidate into an OpenAI ChatMessage,
+// including text content and any functionCall parts mapped to tool_calls.
+func geminiToMessage(gr GeminiResponse) ChatMessage {
+	if len(gr.Candidates) == 0 {
+		return ChatMessage{Role: "assistant"}
 	}
-	b, _ := json.Marshal(toolCalls)
-	return string(b)
+	parts := gr.Candidates[0].Content.Parts
+	msg := ChatMessage{Role: "assistant"}
+	var texts []string
+	for i, p := range parts {
+		if p.FunctionCall != nil {
+			argsJSON, _ := json.Marshal(p.FunctionCall.Args)
+			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
+				ID:   fmt.Sprintf("call_%d", i),
+				Type: "function",
+				Function: FunctionCall{
+					Name:      p.FunctionCall.Name,
+					Arguments: string(argsJSON),
+				},
+			})
+		} else if p.Text != "" {
+			texts = append(texts, p.Text)
+		}
+	}
+	if len(texts) > 0 {
+		msg.Content = strings.Join(texts, "")
+	}
+	return msg
 }
 
 func geminiText(gr GeminiResponse) string {
