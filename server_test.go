@@ -270,7 +270,6 @@ func TestToolResultForwardedAsFunctionResponse(t *testing.T) {
 	}
 }
 
-
 func TestStreamingRetriesOnRateLimitBeforeHeadersWritten(t *testing.T) {
 	var mu sync.Mutex
 	keys := []string{}
@@ -342,6 +341,26 @@ func TestStreamingRetriesOnRateLimitBeforeHeadersWritten(t *testing.T) {
 	}
 	if text != "hello" {
 		t.Fatalf("expected streamed text 'hello', got %q", text)
+	}
+}
+
+func TestGoogleURLUsesV1BetaForGemini2Models(t *testing.T) {
+	proxy := &ProxyServer{cfg: Config{GoogleBaseURL: "https://generativelanguage.googleapis.com/v1/models"}}
+
+	got := proxy.googleURL("gemini-2.0-flash", "generateContent", "secret")
+	want := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=secret"
+	if got != want {
+		t.Fatalf("unexpected Gemini 2.x URL:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestGoogleURLKeepsConfiguredBaseForOlderModels(t *testing.T) {
+	proxy := &ProxyServer{cfg: Config{GoogleBaseURL: "https://generativelanguage.googleapis.com/v1/models"}}
+
+	got := proxy.googleURL("gemini-1.5-pro", "generateContent", "secret")
+	want := "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key=secret"
+	if got != want {
+		t.Fatalf("unexpected non-Gemini-2 URL:\n got: %s\nwant: %s", got, want)
 	}
 }
 
