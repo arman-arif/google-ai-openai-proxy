@@ -256,7 +256,26 @@ func (s *ProxyServer) callGoogle(r *http.Request, lease KeyLease, action string,
 
 func (s *ProxyServer) googleURL(model, action, apiKey string) string {
 	escapedModel := url.PathEscape(model)
-	return fmt.Sprintf("%s/%s:%s?key=%s", s.cfg.GoogleBaseURL, escapedModel, action, url.QueryEscape(apiKey))
+	baseURL := s.googleBaseURLForModel(model)
+	return fmt.Sprintf("%s/%s:%s?key=%s", baseURL, escapedModel, action, url.QueryEscape(apiKey))
+}
+
+func (s *ProxyServer) googleBaseURLForModel(model string) string {
+	baseURL := s.cfg.GoogleBaseURL
+	if !requiresGoogleV1Beta(model) {
+		return baseURL
+	}
+	if strings.Contains(baseURL, "/v1beta/models") {
+		return baseURL
+	}
+	if strings.Contains(baseURL, "/v1/models") {
+		return strings.Replace(baseURL, "/v1/models", "/v1beta/models", 1)
+	}
+	return baseURL
+}
+
+func requiresGoogleV1Beta(model string) bool {
+	return strings.HasPrefix(model, "gemini-2")
 }
 
 func (s *ProxyServer) maxAttempts(model string) int {
