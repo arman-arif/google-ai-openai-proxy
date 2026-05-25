@@ -13,8 +13,9 @@ It sits between your agent and Google AI Studio / Gemini API, translates request
 - Per-model OpenAI alias to Google model mapping.
 - Per-model Google API key pools.
 - Key rotation after `requests_per_api_key` requests.
-- Retry on quota/transient upstream failures (`429`, `500`, `502`, `503`, `504`) by rotating to the next key.
+- Retry on quota/transient upstream failures (`429`, `500`, `502`, `503`, `504`) by forcing rotation to the next key.
 - On selected upstream `403 PERMISSION_DENIED` / "denied access" errors, the proxy removes the bad key from the active in-memory pool and continues with the remaining keys.
+- Gemini 2.x models automatically use Google’s `v1beta` models endpoint when the configured base URL is still `v1`.
 - Filters Gemini/Gemma `thought` parts from returned assistant text so OpenAI-compatible clients receive cleaner content.
 - Optional proxy authentication via OpenAI-style `Authorization: Bearer ...`.
 - Stdlib-only Go implementation; no runtime dependencies.
