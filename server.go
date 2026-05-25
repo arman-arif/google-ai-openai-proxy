@@ -100,8 +100,9 @@ func (s *ProxyServer) generateGemini(w http.ResponseWriter, r *http.Request, ope
 		body, status, err := s.callGoogle(r, lease, "generateContent", geminiReq)
 		if err != nil {
 			lastErr = err.Error()
-			if retryableStatus(status) {
-				s.keys.ForceRotate(openReq.Model, lease.Index)
+			action := retryAction(status, body)
+			if action != 0 {
+				s.applyKeyFailure(openReq.Model, lease.Index, action)
 				continue
 			}
 			writeError(w, statusOr(status, http.StatusBadGateway), lastErr, "upstream_error")
@@ -114,8 +115,9 @@ func (s *ProxyServer) generateGemini(w http.ResponseWriter, r *http.Request, ope
 		}
 		if gr.Error != nil {
 			lastErr = gr.Error.Message
-			if retryableStatus(gr.Error.Code) {
-				s.keys.ForceRotate(openReq.Model, lease.Index)
+			action := retryAction(gr.Error.Code, body)
+			if action != 0 {
+				s.applyKeyFailure(openReq.Model, lease.Index, action)
 				continue
 			}
 			writeError(w, googleHTTPStatus(gr.Error.Code), gr.Error.Message, "upstream_error")
@@ -160,8 +162,9 @@ func (s *ProxyServer) streamGemini(w http.ResponseWriter, r *http.Request, openR
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
 			lastErr = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
-			if retryableStatus(resp.StatusCode) {
-				s.keys.ForceRotate(openReq.Model, lease.Index)
+			action := retryAction(resp.StatusCode, b)
+			if action != 0 {
+				s.applyKeyFailure(openReq.Model, lease.Index, action)
 				slog.Warn("stream upstream error, rotating key and retrying", "attempt", i+1, "status", resp.StatusCode, "model", openReq.Model)
 				continue
 			}
@@ -204,6 +207,9 @@ func (s *ProxyServer) streamGemini(w http.ResponseWriter, r *http.Request, openR
 				continue
 			}
 			for i, p := range gr.Candidates[0].Content.Parts {
+				if p.Thought {
+					continue
+				}
 				if p.FunctionCall != nil {
 					argsJSON, _ := json.Marshal(p.FunctionCall.Args)
 					delta := &ChatDelta{ToolCalls: []DeltaToolCall{{
@@ -422,6 +428,9 @@ func geminiToMessage(gr GeminiResponse) ChatMessage {
 	msg := ChatMessage{Role: "assistant"}
 	var texts []string
 	for i, p := range parts {
+		if p.Thought {
+			continue
+		}
 		if p.FunctionCall != nil {
 			argsJSON, _ := json.Marshal(p.FunctionCall.Args)
 			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
@@ -449,6 +458,9 @@ func geminiText(gr GeminiResponse) string {
 	parts := gr.Candidates[0].Content.Parts
 	texts := make([]string, 0, len(parts))
 	for _, p := range parts {
+		if p.Thought {
+			continue
+		}
 		if p.Text != "" {
 			texts = append(texts, p.Text)
 		}
@@ -470,6 +482,44 @@ func geminiFinishReason(gr GeminiResponse) string {
 	default:
 		return ""
 	}
+}
+
+func (s *ProxyServer) applyKeyFailure(model string, keyIndex int, action KeyFailureAction) {
+	switch action {
+	case KeyFailureRemove:
+		s.keys.RemoveKey(model, keyIndex)
+	default:
+		s.keys.ForceRotate(model, keyIndex)
+	}
+}
+
+func retryAction(status int, body []byte) KeyFailureAction {
+	if status == http.StatusForbidden && isPermissionDenied(body) {
+		return KeyFailureRemove
+	}
+	if retryableStatus(status) {
+		return KeyFailureRotate
+	}
+	return 0
+}
+
+func isPermissionDenied(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var payload struct {
+		Error *struct {
+			Status  string `json:"status"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Error == nil {
+		return false
+	}
+	if strings.EqualFold(payload.Error.Status, "PERMISSION_DENIED") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(payload.Error.Message), "denied access")
 }
 
 func bearerToken(header string) string {

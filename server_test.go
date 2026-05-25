@@ -145,6 +145,165 @@ func TestRetryableUpstreamErrorForcesRotation(t *testing.T) {
 	}
 }
 
+func TestPermissionDeniedForcesRotationAndRemovesKeyFromPool(t *testing.T) {
+	var mu sync.Mutex
+	keys := []string{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		mu.Lock()
+		keys = append(keys, key)
+		mu.Unlock()
+		if key == "denied" {
+			http.Error(w, `{"error":{"code":403,"message":"Your project has been denied access.","status":"PERMISSION_DENIED"}}`, http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"ok after retry"}]},"finishReason":"STOP"}]}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL, ModelKeyPool{GoogleModel: "gemini-test", APIKeys: []string{"denied", "good"}, RequestsPerAPIKey: 100})
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+
+	for i := 0; i < 2; i++ {
+		resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"gpt-test","messages":[{"role":"user","content":"hello"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected retry success after permission denied, got status %d", resp.StatusCode)
+		}
+		var out ChatCompletionResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		if out.Choices[0].Message.Content != "ok after retry" {
+			t.Fatalf("unexpected content after retry: %#v", out.Choices[0].Message)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(keys, ",") != "denied,good,good" {
+		t.Fatalf("expected denied key to be filtered after first permission denial, got %v", keys)
+	}
+}
+
+func TestForbiddenWithoutPermissionDeniedDoesNotRetry(t *testing.T) {
+	var mu sync.Mutex
+	keys := []string{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		mu.Lock()
+		keys = append(keys, key)
+		mu.Unlock()
+		http.Error(w, `{"error":{"code":403,"message":"region blocked","status":"FAILED_PRECONDITION"}}`, http.StatusForbidden)
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL, ModelKeyPool{GoogleModel: "gemini-test", APIKeys: []string{"bad", "good"}, RequestsPerAPIKey: 100})
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"gpt-test","messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected original 403 to be returned, got status %d", resp.StatusCode)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(keys, ",") != "bad" {
+		t.Fatalf("expected no retry for unrelated 403, got %v", keys)
+	}
+}
+
+func TestThoughtPartsAreFilteredFromChatCompletionResponse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"candidates":[{
+				"content":{"parts":[
+					{"text":"internal reasoning","thought":true},
+					{"text":"clean answer"}
+				]},
+				"finishReason":"STOP"
+			}],
+			"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL, ModelKeyPool{GoogleModel: "gemini-test", APIKeys: []string{"k1"}, RequestsPerAPIKey: 100})
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"gpt-test","messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var out ChatCompletionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Choices[0].Message.Content != "clean answer" {
+		t.Fatalf("expected thought text to be filtered, got %q", out.Choices[0].Message.Content)
+	}
+}
+
+func TestThoughtPartsAreFilteredFromStreamingResponse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"internal reasoning\",\"thought\":true},{\"text\":\"clean stream\"}]},\"finishReason\":\"STOP\"}]}\n\n")
+	}))
+	defer upstream.Close()
+
+	proxy := newTestProxy(t, upstream.URL, ModelKeyPool{GoogleModel: "gemini-test", APIKeys: []string{"k1"}, RequestsPerAPIKey: 100})
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var text string
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+		var chunk ChatCompletionChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
+			text += chunk.Choices[0].Delta.Content
+		}
+	}
+	if text != "clean stream" {
+		t.Fatalf("expected streamed thought text to be filtered, got %q", text)
+	}
+}
+
 func TestToolCallRoundtrip(t *testing.T) {
 	// Simulates a Gemini response that contains a functionCall part.
 	// Verifies the proxy translates it back into OpenAI tool_calls shape.
