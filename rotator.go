@@ -27,6 +27,14 @@ type KeyLease struct {
 	Index       int
 }
 
+type KeyFailureAction int
+
+const (
+	KeyFailureNone KeyFailureAction = iota
+	KeyFailureRotate
+	KeyFailureRemove
+)
+
 func NewKeyRotator(cfg Config) (*KeyRotator, error) {
 	def, err := buildPool("*", cfg.DefaultPool)
 	if err != nil && len(cfg.DefaultPool.APIKeys) > 0 {
@@ -90,6 +98,14 @@ func (r *KeyRotator) Lease(model string) (KeyLease, error) {
 }
 
 func (r *KeyRotator) ForceRotate(model string, keyIndex int) {
+	r.markKeyFailed(model, keyIndex, KeyFailureRotate)
+}
+
+func (r *KeyRotator) RemoveKey(model string, keyIndex int) {
+	r.markKeyFailed(model, keyIndex, KeyFailureRemove)
+}
+
+func (r *KeyRotator) markKeyFailed(model string, keyIndex int, action KeyFailureAction) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	pool := r.pools[model]
@@ -100,6 +116,15 @@ func (r *KeyRotator) ForceRotate(model string, keyIndex int) {
 		return
 	}
 	pool.used = 0
+	if action == KeyFailureRemove && len(pool.keys) > 1 {
+		pool.keys = append(pool.keys[:keyIndex], pool.keys[keyIndex+1:]...)
+		if keyIndex >= len(pool.keys) {
+			pool.idx = 0
+		} else {
+			pool.idx = keyIndex
+		}
+		return
+	}
 	pool.idx = (pool.idx + 1) % len(pool.keys)
 }
 
